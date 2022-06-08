@@ -13,26 +13,31 @@ use libp2p::{
 use log::{error, info};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, convert::identity};
-use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
+use tokio::{io::AsyncBufReadExt, sync::mpsc};
+use clap::{Parser, Command, command};
 
-const STORAGE_FILE_PATH: &str = "./recipes.json";
+use crate::args::{AppArgs, CreateUser, CommandType, CreateArticle, ListShowAricles, ListShowPeers};
+use crate::handle::{handle_create_article, handle_list_article, respond_with_public_articles, handle_peer_list};
+pub const ARTICLES_STORAGE_FILE_PATH: &str = "./articles.json";
+pub const USER_STORAGE_FILE_PATH: &str = "./users.json";
+
+mod args;
+mod handle;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 static KEYS: Lazy<identity::Keypair> = Lazy::new(|| identity::Keypair::generate_ed25519());
 static PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(KEYS.public()));
-static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("recipes"));
+static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("articles"));
 
-type Recipes = Vec<Recipe>;
+type Articles = Vec<Article>;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Recipe{
-    id: usize,
-    name: String,
-    ingredients: String,
-    instruction: String,
-    public: bool
+pub struct Article{
+   pub id: usize,
+   pub name: String,
+   pub description: String,
+   pub public: bool
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,17 +52,79 @@ struct ListRequest{
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ListResponce{
+pub struct ListResponse{
     mode: ListMode,
-    data: Recipes,
+    data: Articles,
     receiver: String
 }
 
 enum EventType{
-    Response(ListResponce),
+    Response(ListResponse),
     Input(String)
 }
 
+#[derive(NetworkBehaviour)]
+pub struct ArticleBehaviour{
+   pub floodsub: Floodsub,
+   pub mdns: Mdns,
+    #[behaviour(ignore)]
+   pub response_sender: mpsc::UnboundedSender<ListResponse>
+}
+
+impl NetworkBehaviourEventProcess<FloodsubEvent> for ArticleBehaviour{
+    fn inject_event(&mut self, event: FloodsubEvent){
+        match event {
+            FloodsubEvent::Message(msg) => {
+                if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
+                    if resp.receiver == PEER_ID.to_string() {
+                        info!("Response from {}:", msg.source);
+                        resp.data.iter().for_each(|r| info!("{:?}", r));
+                    }
+                } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
+                    match req.mode {
+                        ListMode::ALL => {
+                            info!("Received ALL req: {:?} from {:?}", req, msg.source);
+                            respond_with_public_articles(
+                                self.response_sender.clone(),
+                                msg.source.to_string(),
+                            );
+                        }
+                        ListMode::One(ref peer_id) => {
+                            if peer_id == &PEER_ID.to_string() {
+                                info!("Received req: {:?} from {:?}", req, msg.source);
+                                respond_with_public_articles(
+                                    self.response_sender.clone(),
+                                    msg.source.to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+
+impl NetworkBehaviourEventProcess<MdnsEvent> for ArticleBehaviour {
+    fn inject_event(&mut self, event: MdnsEvent) {
+        match event {
+            MdnsEvent::Discovered(discovered_list) => {
+                for (peer, _addr) in discovered_list {
+                    self.floodsub.add_node_to_partial_view(peer);
+                }
+            }
+            MdnsEvent::Expired(expired_list) => {
+                for (peer, _addr) in expired_list {
+                    if !self.mdns.has_node(&peer) {
+                        self.floodsub.remove_node_from_partial_view(&peer);
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -76,12 +143,18 @@ async fn main() {
         .multiplex(mplex::MplexConfig::new())
         .boxed();
 
-    let mut behavior = RecipeBehaviour {
-        //TODO
+    let mut behaviour = ArticleBehaviour {
+        floodsub: Floodsub::new(PEER_ID.clone()),
+        mdns: Mdns::new(Default::default())
+            .await
+            .expect("can create mdns"),
+        response_sender,
     };
 
+    behaviour.floodsub.subscribe(TOPIC.clone());
 
-    let mut swarm = SwarmBuilder::new(transp, behavior, PEER_ID.clone())
+
+    let mut swarm = SwarmBuilder::new(transp, behaviour, PEER_ID.clone())
         .executor(Box::new(|fut| {
             tokio::spawn(fut);
         }))
@@ -95,19 +168,24 @@ async fn main() {
     )
         .expect("swarm can be started");
 
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let args = AppArgs::parse();
 
-    loop {
-        let evt = {
-            tokio::select! {
-                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                event = swarm.next() => {
-                    info!("Unhandled Swarm Event: {:?}", event);
-                    None
-                },
-                response = response_recv.recv() => Some(EventType::Response(response.expect("response exists"))),
-            }
-        };
+    match &args.command_type {
+        CommandType::CreateUser(CreateUser { name, email }) => {
+            println!("test {:?} {:?}", name, email);
+
+        },
+        CommandType::CreateArticle(CreateArticle{ name, text}) => {
+            println!("{:?}, {:?}", name, text);
+            handle_create_article(name, text).await
+        },
+        CommandType::ListShowArticle(ListShowAricles{id}) => {
+            println!("id is {:?}", id);
+            handle_list_article(id.clone(), &mut swarm).await
+        },
+        CommandType::ListShowPeers(ListShowPeers) => {
+            println!("show peers");
+            handle_peer_list(&mut swarm).await
+        }
     }
-
 }
